@@ -5594,9 +5594,6 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        if *a16 && name.starts_with("image_sample_b") {
-            return Err("a biased image sample with 16-bit coordinates");
-        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -5855,6 +5852,29 @@ impl<'a> Lower<'a> {
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
             let grads = if op == 63 { 2 * spatial } else { 0 };
+            // `addr_val` index of logical address `k`. With a16 the extra
+            // words (offset, bias, reference) keep a whole VGPR each, each
+            // gradient direction is padded to whole VGPRs, and the
+            // coordinates start on a fresh VGPR (packed in halves).
+            let per_dir = spatial.div_ceil(2);
+            let slot = |k: usize| -> usize {
+                if !*a16 {
+                    k
+                } else if k < first {
+                    2 * k
+                } else if k < first + grads {
+                    let g = k - first;
+                    2 * first + g / spatial * 2 * per_dir + g % spatial
+                } else {
+                    2 * (first + if grads > 0 { 2 * per_dir } else { 0 }) + (k - first - grads)
+                }
+            };
+            // An extra word: the whole VGPR at `k`.
+            let extra = |l: &mut Self, k: usize| -> Result<V, Why> {
+                let r = *regs.get(k).ok_or("an image address")?;
+                let v = inst.read(Reg::V(r)).ok_or("an image address")?;
+                l.i32_of(v)
+            };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -5865,9 +5885,9 @@ impl<'a> Lower<'a> {
                     l.as_float(x)
                 }
             };
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                let x = addr_val(self, first + grads + k)?;
-                *slot = to_float(self, x);
+            for (k, out) in cs.iter_mut().enumerate().take(coords) {
+                let x = addr_val(self, slot(first + grads + k))?;
+                *out = to_float(self, x);
             }
             if kind == 5 {
                 if *unorm || op == 63 || op == 81 {
@@ -5928,7 +5948,7 @@ impl<'a> Lower<'a> {
                     if offset_word {
                         // DXIL takes immediate offsets in -8..=7; the
                         // console's are 6-bit and may be computed.
-                        let w = addr_val(self, 0)?;
+                        let w = extra(self, 0)?;
                         let w = self
                             .s
                             .m
@@ -5950,8 +5970,9 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
-                    let bias = self.as_float(bias);
+                    // With a16 the bias is an f16 in the low half of its VGPR.
+                    let bias = extra(self, usize::from(offset_word))?;
+                    let bias = to_float(self, bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
                     self.s.op(
@@ -5966,9 +5987,9 @@ impl<'a> Lower<'a> {
                 63 => {
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
-                        let x = addr_val(self, first + k)?;
+                        let x = addr_val(self, slot(first + k))?;
                         g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
+                        let y = addr_val(self, slot(first + spatial + k))?;
                         g[3 + k] = to_float(self, y);
                     }
                     args.extend(&os);
@@ -5999,7 +6020,7 @@ impl<'a> Lower<'a> {
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
-                        let x = addr_val(self, coords)?;
+                        let x = addr_val(self, slot(first + coords))?;
                         to_float(self, x)
                     } else {
                         self.s.m.f32(0)
@@ -6023,7 +6044,7 @@ impl<'a> Lower<'a> {
                         return Err("a gather of several channels");
                     }
                     if offset_word {
-                        let w = addr_val(self, 0)?;
+                        let w = extra(self, 0)?;
                         for (k, at) in [(0, 26), (1, 18)] {
                             // Bits at..at+5 sign-extended: shift up, then down.
                             let left = self.s.m.i32(at);
